@@ -559,6 +559,7 @@ typedef struct Upvaldesc {
 */
 typedef struct LocVar {
   TString *varname;
+  TString *type;
   int startpc;  /* first point where variable is active */
   int endpc;    /* first point where variable is dead */
 } LocVar;

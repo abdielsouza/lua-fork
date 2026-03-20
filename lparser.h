@@ -74,6 +74,8 @@ typedef enum {
 #define vkisvar(k)	(VLOCAL <= (k) && (k) <= VINDEXSTR)
 #define vkisindexed(k)	(VINDEXED <= (k) && (k) <= VINDEXSTR)
 
+typedef struct TypeInfo TypeInfo;
+
 
 typedef struct expdesc {
   expkind k;
@@ -93,9 +95,25 @@ typedef struct expdesc {
       short vidx;  /* index in 'actvar.arr' */
     } var;
   } u;
+  lu_byte etype;  /* static type inferred for this expression */
+  TypeInfo *tinfo;  /* detailed type info for static typing */
   int t;  /* patch list of 'exit when true' */
   int f;  /* patch list of 'exit when false' */
 } expdesc;
+
+
+/* static types for variables/expressions */
+#define VTYPE_UNKNOWN	0
+#define VTYPE_NIL	(1u << 0)
+#define VTYPE_INT	(1u << 1)
+#define VTYPE_FLOAT	(1u << 2)
+#define VTYPE_STRING	(1u << 3)
+#define VTYPE_BOOL	(1u << 4)
+#define VTYPE_TABLE	(1u << 5)
+#define VTYPE_FUNCTION	(1u << 6)
+#define VTYPE_UNIT	(1u << 7)
+#define VTYPE_ANY	(VTYPE_NIL | VTYPE_INT | VTYPE_FLOAT | \
+  VTYPE_STRING | VTYPE_BOOL | VTYPE_TABLE | VTYPE_FUNCTION | VTYPE_UNIT)
 
 
 /* kinds of variables */
@@ -119,9 +137,12 @@ typedef union Vardesc {
   struct {
     TValuefields;  /* constant value (if it is a compile-time constant) */
     lu_byte kind;
+    lu_byte type;  /* declared static type */
+    lu_byte inferred;  /* type inferred from initialization */
     lu_byte ridx;  /* register holding the variable */
     short pidx;  /* index of the variable in the Proto's 'locvars' array */
     TString *name;  /* variable name */
+    TypeInfo *tinfo;  /* detailed static type */
   } vd;
   TValue k;  /* constant value (if any) */
 } Vardesc;
@@ -183,6 +204,8 @@ typedef struct FuncState {
   lu_byte freereg;  /* first free register */
   lu_byte iwthabs;  /* instructions issued since last absolute line info */
   lu_byte needclose;  /* function needs to close upvalues when returning */
+  lu_byte rettype;  /* declared function return type */
+  TypeInfo *rettinfo;  /* detailed declared function return type */
 } FuncState;
 
 

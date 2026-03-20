@@ -63,6 +63,7 @@ typedef struct BlockCnt {
 */
 static void statement (LexState *ls);
 static void expr (LexState *ls, expdesc *v);
+static Vardesc *getlocalvardesc (FuncState *fs, int vidx);
 
 
 static l_noret error_expected (LexState *ls, int token) {
@@ -149,10 +150,83 @@ static TString *str_checkname (LexState *ls) {
 }
 
 
+typedef struct FuncSigType {
+  int nparams;
+  TypeInfo **params;
+  TypeInfo *ret;
+} FuncSigType;
+
+
+typedef struct TableFieldType {
+  TString *name;
+  TypeInfo *type;
+  struct TableFieldType *next;
+} TableFieldType;
+
+
+struct TypeInfo {
+  lu_byte mask;
+  FuncSigType *func;
+  TableFieldType *fields;
+};
+
+
+static TypeInfo *newtypeinfo (LexState *ls, lu_byte mask) {
+  TypeInfo *ti = luaM_new(ls->L, TypeInfo);
+  ti->mask = mask;
+  ti->func = NULL;
+  ti->fields = NULL;
+  return ti;
+}
+
+
+static FuncSigType *newfuncsig (LexState *ls, int nparams) {
+  FuncSigType *sig = luaM_new(ls->L, FuncSigType);
+  sig->nparams = nparams;
+  sig->ret = NULL;
+  if (nparams > 0)
+    sig->params = luaM_newvector(ls->L, nparams, TypeInfo *);
+  else
+    sig->params = NULL;
+  return sig;
+}
+
+
+static TableFieldType *newtablefield (LexState *ls, TString *name, TypeInfo *type) {
+  TableFieldType *field = luaM_new(ls->L, TableFieldType);
+  field->name = name;
+  field->type = type;
+  field->next = NULL;
+  return field;
+}
+
+
+static TableFieldType *findtablefield (TableFieldType *fields, TString *name) {
+  while (fields != NULL) {
+    if (eqstr(fields->name, name))
+      return fields;
+    fields = fields->next;
+  }
+  return NULL;
+}
+
+
+static int typecompatiblefull (lu_byte declared, TypeInfo *dinfo,
+                               lu_byte assigned, TypeInfo *ainfo);
+
+
+static int typeequalfull (lu_byte t1, TypeInfo *i1, lu_byte t2, TypeInfo *i2) {
+  return typecompatiblefull(t1, i1, t2, i2) &&
+         typecompatiblefull(t2, i2, t1, i1);
+}
+
+
 static void init_exp (expdesc *e, expkind k, int i) {
   e->f = e->t = NO_JUMP;
   e->k = k;
   e->u.info = i;
+  e->etype = VTYPE_UNKNOWN;
+  e->tinfo = NULL;
 }
 
 
@@ -160,11 +234,281 @@ static void codestring (expdesc *e, TString *s) {
   e->f = e->t = NO_JUMP;
   e->k = VKSTR;
   e->u.strval = s;
+  e->etype = VTYPE_STRING;
+  e->tinfo = NULL;
 }
 
 
 static void codename (LexState *ls, expdesc *e) {
   codestring(e, str_checkname(ls));
+}
+
+
+static lu_byte nametovtype (TString *name) {
+  const char *s = getstr(name);
+  if (strcmp(s, "anytype") == 0) return VTYPE_ANY;
+  if (strcmp(s, "int") == 0) return VTYPE_INT;
+  if (strcmp(s, "float") == 0) return VTYPE_FLOAT;
+  if (strcmp(s, "str") == 0) return VTYPE_STRING;
+  if (strcmp(s, "bool") == 0) return VTYPE_BOOL;
+  if (strcmp(s, "nil") == 0) return VTYPE_NIL;
+  if (strcmp(s, "function") == 0) return VTYPE_FUNCTION;
+  if (strcmp(s, "void") == 0) return VTYPE_UNIT;
+  if (strcmp(s, "unit") == 0) return VTYPE_UNIT;
+  if (strcmp(s, "tabletype") == 0) return VTYPE_TABLE;
+  return VTYPE_UNKNOWN;
+}
+
+
+static lu_byte parsetypeexpr (LexState *ls, TypeInfo **tinfo);
+
+
+static int testnextarrow (LexState *ls) {
+  if (ls->t.token != '-')
+    return 0;
+  luaX_next(ls);
+  checknext(ls, '>');
+  return 1;
+}
+
+
+static lu_byte parsetypeprimary (LexState *ls, TypeInfo **tinfo) {
+  lu_byte vtype;
+  *tinfo = NULL;
+  if (ls->t.token == TK_FUNCTION) {
+    TypeInfo *fi;
+    FuncSigType *sig;
+    int nparams = 0;
+    int psize = 0;
+    TypeInfo **params = NULL;
+    luaX_next(ls);
+    checknext(ls, '(');
+    if (ls->t.token != ')') {
+      do {
+        TypeInfo *ptype = NULL;
+        lu_byte pmask;
+        luaM_growvector(ls->L, params, nparams + 1, psize,
+                        TypeInfo *, MAXVARS, "function type parameters");
+        pmask = parsetypeexpr(ls, &ptype);
+        if (ptype == NULL)
+          ptype = newtypeinfo(ls, pmask);
+        params[nparams++] = ptype;
+      } while (testnext(ls, ','));
+    }
+    checknext(ls, ')');
+    fi = newtypeinfo(ls, VTYPE_FUNCTION);
+    sig = newfuncsig(ls, nparams);
+    if (nparams > 0)
+      memcpy(sig->params, params, cast_sizet(nparams) * sizeof(TypeInfo *));
+    if (testnextarrow(ls) || testnext(ls, TK_DBCOLON)) {
+      TypeInfo *retinfo = NULL;
+      lu_byte rettype = parsetypeexpr(ls, &retinfo);
+      if (retinfo == NULL)
+        retinfo = newtypeinfo(ls, rettype);
+      sig->ret = retinfo;
+    }
+    else
+      sig->ret = newtypeinfo(ls, VTYPE_UNIT);
+    fi->func = sig;
+    *tinfo = fi;
+    return VTYPE_FUNCTION;
+  }
+  check(ls, TK_NAME);
+  vtype = nametovtype(ls->t.seminfo.ts);
+  if (vtype == VTYPE_UNKNOWN)
+    vtype = VTYPE_ANY;  /* unknown/custom named types are accepted */
+  luaX_next(ls);  /* skip type name */
+  if (testnext(ls, '<')) {  /* generic type arguments */
+    if (ls->t.token == '>')
+      luaX_syntaxerror(ls, "type expected inside generic arguments");
+    if (vtype == VTYPE_TABLE && ls->t.token == TK_NAME && luaX_lookahead(ls) == ':') {
+      TypeInfo *ti = newtypeinfo(ls, VTYPE_TABLE);
+      TableFieldType *last = NULL;
+      do {
+        TString *fname = str_checkname(ls);
+        TypeInfo *ftinfo = NULL;
+        TableFieldType *field;
+        lu_byte ftype;
+        checknext(ls, ':');
+        ftype = parsetypeexpr(ls, &ftinfo);
+        if (ftinfo == NULL)
+          ftinfo = newtypeinfo(ls, ftype);
+        if (findtablefield(ti->fields, fname) != NULL)
+          luaK_semerror(ls, "duplicated tabletype field '%s'", getstr(fname));
+        field = newtablefield(ls, fname, ftinfo);
+        if (last == NULL)
+          ti->fields = field;
+        else
+          last->next = field;
+        last = field;
+      } while (testnext(ls, ','));
+      *tinfo = ti;
+    }
+    else {
+      do {
+        TypeInfo *ignored = NULL;
+        parsetypeexpr(ls, &ignored);
+      } while (testnext(ls, ','));
+    }
+    checknext(ls, '>');
+  }
+  if ((vtype == VTYPE_FUNCTION || vtype == VTYPE_TABLE) && *tinfo == NULL)
+    *tinfo = newtypeinfo(ls, vtype);
+  else if (vtype == VTYPE_UNIT)
+    *tinfo = newtypeinfo(ls, vtype);
+  return vtype;
+}
+
+
+static lu_byte parsetypeexpr (LexState *ls, TypeInfo **tinfo) {
+  TypeInfo *curinfo = NULL;
+  lu_byte vtype = parsetypeprimary(ls, &curinfo);
+  while (testnext(ls, '|')) {
+    TypeInfo *rinfo = NULL;
+    lu_byte rtype = parsetypeprimary(ls, &rinfo);
+    lu_byte merged = cast_byte(vtype | rtype);
+    if ((rtype == VTYPE_NIL && curinfo != NULL) ||
+        (vtype == VTYPE_NIL && rinfo != NULL)) {
+      TypeInfo *opt = (rtype == VTYPE_NIL) ? curinfo : rinfo;
+      opt->mask = merged;
+      curinfo = opt;
+    }
+    else if (curinfo != NULL || rinfo != NULL)
+      curinfo = NULL;
+    vtype = merged;
+  }
+  *tinfo = curinfo;
+  return vtype;
+}
+
+
+static lu_byte gettypeannotation (LexState *ls, lu_byte dftype,
+                                  TypeInfo **tinfo, int *annotated) {
+  *annotated = 0;
+  *tinfo = NULL;
+  if (testnext(ls, TK_DBCOLON)) {
+    *annotated = 1;
+    return parsetypeexpr(ls, tinfo);
+  }
+  return dftype;
+}
+
+
+static const char *vtypename (lu_byte vtype) {
+  static char namebuf[64];
+  size_t len = 0;
+  if (vtype == VTYPE_ANY) return "anytype";
+  if (vtype == VTYPE_UNKNOWN) return "unknown";
+  if (vtype & VTYPE_NIL) {
+    memcpy(namebuf + len, "nil", sizeof("nil") - 1);
+    len += sizeof("nil") - 1;
+  }
+  if (vtype & VTYPE_INT) {
+    if (len > 0) namebuf[len++] = '|';
+    memcpy(namebuf + len, "int", sizeof("int") - 1);
+    len += sizeof("int") - 1;
+  }
+  if (vtype & VTYPE_FLOAT) {
+    if (len > 0) namebuf[len++] = '|';
+    memcpy(namebuf + len, "float", sizeof("float") - 1);
+    len += sizeof("float") - 1;
+  }
+  if (vtype & VTYPE_STRING) {
+    if (len > 0) namebuf[len++] = '|';
+    memcpy(namebuf + len, "str", sizeof("str") - 1);
+    len += sizeof("str") - 1;
+  }
+  if (vtype & VTYPE_BOOL) {
+    if (len > 0) namebuf[len++] = '|';
+    memcpy(namebuf + len, "bool", sizeof("bool") - 1);
+    len += sizeof("bool") - 1;
+  }
+  if (vtype & VTYPE_TABLE) {
+    if (len > 0) namebuf[len++] = '|';
+    memcpy(namebuf + len, "tabletype", sizeof("tabletype") - 1);
+    len += sizeof("tabletype") - 1;
+  }
+  if (vtype & VTYPE_FUNCTION) {
+    if (len > 0) namebuf[len++] = '|';
+    memcpy(namebuf + len, "function", sizeof("function") - 1);
+    len += sizeof("function") - 1;
+  }
+  if (vtype & VTYPE_UNIT) {
+    if (len > 0) namebuf[len++] = '|';
+    memcpy(namebuf + len, "unit", sizeof("unit") - 1);
+    len += sizeof("unit") - 1;
+  }
+  if (len == 0)
+    return "unknown";
+  namebuf[len] = '\0';
+  return namebuf;
+}
+
+
+static TString *vtypetostring (LexState *ls, lu_byte vtype) {
+  if (vtype == VTYPE_UNKNOWN)
+    return NULL;
+  return luaS_new(ls->L, vtypename(vtype));
+}
+
+
+static int typecompatiblefull (lu_byte declared, TypeInfo *dinfo,
+                               lu_byte assigned, TypeInfo *ainfo) {
+  TableFieldType *f;
+  if (declared == VTYPE_ANY || declared == VTYPE_UNKNOWN)
+    return 1;
+  if (assigned == VTYPE_UNKNOWN || assigned == VTYPE_ANY)
+    return 1;
+  if (assigned & VTYPE_INT)
+    assigned = cast_byte(assigned | VTYPE_FLOAT);
+  if ((declared & assigned) == 0)
+    return 0;
+  if ((declared & VTYPE_FUNCTION) && dinfo != NULL && dinfo->func != NULL) {
+    int i;
+    if (ainfo == NULL || ainfo->func == NULL)
+      return 0;
+    if (dinfo->func->nparams != ainfo->func->nparams)
+      return 0;
+    for (i = 0; i < dinfo->func->nparams; i++) {
+      TypeInfo *dp = dinfo->func->params[i];
+      TypeInfo *ap = ainfo->func->params[i];
+      if (!typeequalfull(dp->mask, dp, ap->mask, ap))
+        return 0;
+    }
+    if (!typeequalfull(dinfo->func->ret->mask, dinfo->func->ret,
+                       ainfo->func->ret->mask, ainfo->func->ret))
+      return 0;
+  }
+  if ((declared & VTYPE_TABLE) && dinfo != NULL && dinfo->fields != NULL) {
+    if (ainfo == NULL)
+      return 1;
+    for (f = dinfo->fields; f != NULL; f = f->next) {
+      TableFieldType *af = findtablefield(ainfo->fields, f->name);
+      if (af == NULL)
+        return 0;
+      if (!typecompatiblefull(f->type->mask, f->type,
+                              af->type->mask, af->type))
+        return 0;
+    }
+  }
+  return 1;
+}
+
+
+static TypeInfo *vartinfofromexp (LexState *ls, expdesc *v) {
+  FuncState *fs = ls->fs;
+  switch (v->k) {
+    case VLOCAL: case VVARGVAR:
+      return getlocalvardesc(fs, v->u.var.vidx)->vd.tinfo;
+    case VCONST:
+      return NULL;
+    case VGLOBAL:
+      if (v->u.info >= 0)
+        return ls->dyd->actvar.arr[v->u.info].vd.tinfo;
+      return NULL;
+    default:
+      return v->tinfo;
+  }
 }
 
 
@@ -178,9 +522,12 @@ static short registerlocalvar (LexState *ls, FuncState *fs,
   int oldsize = f->sizelocvars;
   luaM_growvector(ls->L, f->locvars, fs->ndebugvars, f->sizelocvars,
                   LocVar, SHRT_MAX, "local variables");
-  while (oldsize < f->sizelocvars)
+  while (oldsize < f->sizelocvars) {
     f->locvars[oldsize++].varname = NULL;
+    f->locvars[oldsize - 1].type = NULL;
+  }
   f->locvars[fs->ndebugvars].varname = varname;
+  f->locvars[fs->ndebugvars].type = NULL;
   f->locvars[fs->ndebugvars].startpc = fs->pc;
   luaC_objbarrier(ls->L, f, varname);
   return fs->ndebugvars++;
@@ -191,7 +538,8 @@ static short registerlocalvar (LexState *ls, FuncState *fs,
 ** Create a new variable with the given 'name' and given 'kind'.
 ** Return its index in the function.
 */
-static int new_varkind (LexState *ls, TString *name, lu_byte kind) {
+static int new_varkind (LexState *ls, TString *name, lu_byte kind,
+                        lu_byte vtype, TypeInfo *tinfo, lu_byte inferred) {
   lua_State *L = ls->L;
   FuncState *fs = ls->fs;
   Dyndata *dyd = ls->dyd;
@@ -200,6 +548,9 @@ static int new_varkind (LexState *ls, TString *name, lu_byte kind) {
              dyd->actvar.size, Vardesc, SHRT_MAX, "variable declarations");
   var = &dyd->actvar.arr[dyd->actvar.n++];
   var->vd.kind = kind;  /* default */
+  var->vd.type = vtype;
+  var->vd.tinfo = tinfo;
+  var->vd.inferred = inferred;
   var->vd.name = name;
   return dyd->actvar.n - 1 - fs->firstlocal;
 }
@@ -209,7 +560,7 @@ static int new_varkind (LexState *ls, TString *name, lu_byte kind) {
 ** Create a new local variable with the given 'name' and regular kind.
 */
 static int new_localvar (LexState *ls, TString *name) {
-  return new_varkind(ls, name, VDKREG);
+  return new_varkind(ls, name, VDKREG, VTYPE_ANY, NULL, 0);
 }
 
 #define new_localvarliteral(ls,v) \
@@ -275,6 +626,8 @@ static void init_var (FuncState *fs, expdesc *e, int vidx) {
   e->k = VLOCAL;
   e->u.var.vidx = cast_short(vidx);
   e->u.var.ridx = getlocalvardesc(fs, vidx)->vd.ridx;
+  e->etype = getlocalvardesc(fs, vidx)->vd.type;
+  e->tinfo = getlocalvardesc(fs, vidx)->vd.tinfo;
 }
 
 
@@ -332,8 +685,13 @@ static void adjustlocalvars (LexState *ls, int nvars) {
   for (i = 0; i < nvars; i++) {
     int vidx = fs->nactvar++;
     Vardesc *var = getlocalvardesc(fs, vidx);
+    short pidx;
     var->vd.ridx = cast_byte(reglevel++);
-    var->vd.pidx = registerlocalvar(ls, fs, var->vd.name);
+    pidx = registerlocalvar(ls, fs, var->vd.name);
+    var->vd.pidx = pidx;
+    fs->f->locvars[pidx].type = vtypetostring(ls, var->vd.type);
+    if (fs->f->locvars[pidx].type != NULL)
+      luaC_objbarrier(ls->L, fs->f, fs->f->locvars[pidx].type);
     luaY_checklimit(fs, reglevel, MAXVARS, "local variables");
   }
 }
@@ -423,6 +781,8 @@ static int searchvar (FuncState *fs, TString *n, expdesc *var) {
       else {  /* global name */
         if (eqstr(n, vd->vd.name)) {  /* found? */
           init_exp(var, VGLOBAL, fs->firstlocal + i);
+          var->etype = vd->vd.type;
+          var->tinfo = vd->vd.tinfo;
           return VGLOBAL;
         }
         else if (var->u.info == -1)  /* active preambular declaration? */
@@ -430,12 +790,17 @@ static int searchvar (FuncState *fs, TString *n, expdesc *var) {
       }
     }
     else if (eqstr(n, vd->vd.name)) {  /* found? */
-      if (vd->vd.kind == RDKCTC)  /* compile-time constant? */
+      if (vd->vd.kind == RDKCTC) {  /* compile-time constant? */
         init_exp(var, VCONST, fs->firstlocal + i);
+        var->etype = VTYPE_UNKNOWN;
+        var->tinfo = NULL;
+      }
       else {  /* local variable */
         init_var(fs, var, i);
         if (vd->vd.kind == RDKVAVAR)  /* vararg parameter? */
           var->k = VVARGVAR;
+        var->etype = vd->vd.type;
+        var->tinfo = vd->vd.tinfo;
       }
       return cast_int(var->k);
     }
@@ -495,6 +860,8 @@ static void singlevaraux (FuncState *fs, TString *n, expdesc *var, int base) {
         return;  /* don't need to do anything at this level */
     }
     init_exp(var, VUPVAL, idx);  /* new or old upvalue */
+    var->etype = VTYPE_UNKNOWN;
+    var->tinfo = NULL;
   }
 }
 
@@ -510,6 +877,8 @@ static void buildglobal (LexState *ls, TString *varname, expdesc *var) {
   luaK_exp2anyregup(fs, var);  /* _ENV could be a constant */
   codestring(&key, varname);  /* key is variable name */
   luaK_indexed(fs, var, &key);  /* 'var' represents _ENV[varname] */
+  var->etype = VTYPE_UNKNOWN;
+  var->tinfo = NULL;
 }
 
 
@@ -523,10 +892,15 @@ static void buildvar (LexState *ls, TString *varname, expdesc *var) {
   singlevaraux(fs, varname, var, 1);
   if (var->k == VGLOBAL) {  /* global name? */
     int info = var->u.info;
+    lu_byte gtype = VTYPE_ANY;
+    if (info >= 0)
+      gtype = ls->dyd->actvar.arr[info].vd.type;
     /* global by default in the scope of a global declaration? */
     if (info == -2)
       luaK_semerror(ls, "variable '%s' not declared", getstr(varname));
     buildglobal(ls, varname, var);
+    var->etype = gtype;
+    var->tinfo = (info >= 0) ? ls->dyd->actvar.arr[info].vd.tinfo : NULL;
     if (info != -1 && ls->dyd->actvar.arr[info].vd.kind == GDKCONST)
       var->u.ind.ro = 1;  /* mark variable as read-only */
     else  /* anyway must be a global */
@@ -564,6 +938,130 @@ static void adjust_assign (LexState *ls, int nvars, int nexps, expdesc *e) {
     luaK_reserveregs(fs, needed);  /* registers for extra values */
   else  /* adding 'needed' is actually a subtraction */
     fs->freereg = cast_byte(fs->freereg + needed);  /* remove extra values */
+}
+
+
+static int explisttyped (LexState *ls, expdesc *v,
+                         lu_byte *types, TypeInfo **tinfos, int maxtypes) {
+  int n = 1;  /* at least one expression */
+  expr(ls, v);
+  if (types != NULL && maxtypes > 0) {
+    types[0] = v->etype;
+    if (tinfos != NULL)
+      tinfos[0] = v->tinfo;
+  }
+  while (testnext(ls, ',')) {
+    luaK_exp2nextreg(ls->fs, v);
+    expr(ls, v);
+    if (types != NULL && n < maxtypes) {
+      types[n] = v->etype;
+      if (tinfos != NULL)
+        tinfos[n] = v->tinfo;
+    }
+    n++;
+  }
+  return n;
+}
+
+
+static TString *varnamefromexp (LexState *ls, expdesc *v) {
+  FuncState *fs = ls->fs;
+  switch (v->k) {
+    case VLOCAL: case VVARGVAR:
+      return getlocalvardesc(fs, v->u.var.vidx)->vd.name;
+    case VUPVAL:
+      return fs->f->upvalues[v->u.info].name;
+    case VGLOBAL:
+      if (v->u.info >= 0)
+        return ls->dyd->actvar.arr[v->u.info].vd.name;
+      break;
+    case VINDEXED: case VVARGIND: case VINDEXUP: case VINDEXSTR:
+      if (v->u.ind.keystr >= 0)
+        return tsvalue(&fs->f->k[v->u.ind.keystr]);
+      break;
+    default:
+      break;
+  }
+  return NULL;
+}
+
+
+static void inferassignedtype (LexState *ls, expdesc *var,
+                               lu_byte exptype, TypeInfo *extinfo) {
+  FuncState *fs = ls->fs;
+  if (exptype == VTYPE_UNKNOWN || exptype == VTYPE_ANY)
+    return;
+  switch (var->k) {
+    case VLOCAL:
+    case VVARGVAR: {
+      Vardesc *vd = getlocalvardesc(fs, var->u.var.vidx);
+      if (vd->vd.inferred) {
+        vd->vd.type = exptype;
+        vd->vd.tinfo = extinfo;
+        vd->vd.inferred = 0;
+        var->etype = exptype;
+        var->tinfo = extinfo;
+      }
+      break;
+    }
+    case VGLOBAL: {
+      if (var->u.info >= 0) {
+        Vardesc *vd = &ls->dyd->actvar.arr[var->u.info];
+        if (vd->vd.inferred) {
+          vd->vd.type = exptype;
+          vd->vd.tinfo = extinfo;
+          vd->vd.inferred = 0;
+          var->etype = exptype;
+          var->tinfo = extinfo;
+        }
+      }
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+
+static void checktypeassign (LexState *ls, expdesc *var,
+                             lu_byte exptype, TypeInfo *extinfo) {
+  lu_byte vartype = var->etype;
+  TypeInfo *vtinfo = var->tinfo;
+  inferassignedtype(ls, var, exptype, extinfo);
+  vartype = var->etype;
+  vtinfo = var->tinfo;
+  if (!typecompatiblefull(vartype, vtinfo, exptype, extinfo)) {
+    TString *etname = vtypetostring(ls, exptype);
+    TString *vtname = vtypetostring(ls, vartype);
+    const char *expname = (etname != NULL) ? getstr(etname) : "unknown";
+    const char *varname = (vtname != NULL) ? getstr(vtname) : "unknown";
+    TString *vname = varnamefromexp(ls, var);
+    const char *name = (vname != NULL) ? getstr(vname) : "(expression)";
+    luaK_semerror(ls, "cannot assign '%s' to '%s' variable '%s'",
+                      expname, varname, name);
+  }
+}
+
+
+static lu_byte rhstypeat (int i, int nvars, int nexps,
+                          const expdesc *last, const lu_byte *types,
+                          TypeInfo *const *tinfos, TypeInfo **outinfo) {
+  UNUSED(nvars);
+  *outinfo = NULL;
+  if (nexps == 0)
+    return VTYPE_NIL;
+  if (i < nexps - 1) {
+    if (tinfos != NULL)
+      *outinfo = tinfos[i];
+    return (types != NULL) ? types[i] : VTYPE_UNKNOWN;
+  }
+  if (i == nexps - 1) {
+    *outinfo = last->tinfo;
+    return last->etype;
+  }
+  if (hasmultret(last->k))
+    return VTYPE_UNKNOWN;
+  return VTYPE_NIL;
 }
 
 
@@ -814,6 +1312,8 @@ static void open_func (LexState *ls, FuncState *fs, BlockCnt *bl) {
   fs->ndebugvars = 0;
   fs->nactvar = 0;
   fs->needclose = 0;
+  fs->rettype = VTYPE_UNKNOWN;
+  fs->rettinfo = NULL;
   fs->firstlocal = ls->dyd->actvar.n;
   fs->firstlabel = ls->dyd->label.n;
   fs->bl = NULL;
@@ -888,10 +1388,23 @@ static void fieldsel (LexState *ls, expdesc *v) {
   /* fieldsel -> ['.' | ':'] NAME */
   FuncState *fs = ls->fs;
   expdesc key;
+  TString *fname;
+  lu_byte ttype = v->etype;
+  TypeInfo *ttinfo = vartinfofromexp(ls, v);
   luaK_exp2anyregup(fs, v);
   luaX_next(ls);  /* skip the dot or colon */
   codename(ls, &key);
+  fname = key.u.strval;
   luaK_indexed(fs, v, &key);
+  v->etype = VTYPE_UNKNOWN;
+  v->tinfo = NULL;
+  if ((ttype & VTYPE_TABLE) && ttinfo != NULL && ttinfo->fields != NULL) {
+    TableFieldType *field = findtablefield(ttinfo->fields, fname);
+    if (field == NULL)
+      luaK_semerror(ls, "field '%s' is not declared in tabletype", getstr(fname));
+    v->etype = field->type->mask;
+    v->tinfo = field->type;
+  }
 }
 
 
@@ -1036,6 +1549,7 @@ static void constructor (LexState *ls, expdesc *t) {
   cc.na = cc.nh = cc.tostore = 0;
   cc.t = t;
   init_exp(t, VNONRELOC, fs->freereg);  /* table will be at stack top */
+  t->etype = VTYPE_TABLE;
   luaK_reserveregs(fs, 1);
   init_exp(&cc.v, VVOID, 0);  /* no value (yet) */
   checknext(ls, '{' /*}*/);
@@ -1072,17 +1586,29 @@ static void parlist (LexState *ls) {
     do {
       switch (ls->t.token) {
         case TK_NAME: {
-          new_localvar(ls, str_checkname(ls));
+          TString *pname = str_checkname(ls);
+          TypeInfo *ptinfo = NULL;
+          int pann = 0;
+          lu_byte ptype = gettypeannotation(ls, VTYPE_ANY, &ptinfo, &pann);
+          new_varkind(ls, pname, VDKREG, ptype, ptinfo, 0);
           nparams++;
           break;
         }
         case TK_DOTS: {
           varargk = 1;
           luaX_next(ls);  /* skip '...' */
-          if (ls->t.token == TK_NAME)
-            new_varkind(ls, str_checkname(ls), RDKVAVAR);
+          if (ls->t.token == TK_NAME) {
+            TString *vname = str_checkname(ls);
+            TypeInfo *vtinfo = NULL;
+            int vann = 0;
+            lu_byte vtype = gettypeannotation(ls, VTYPE_TABLE, &vtinfo, &vann);
+            new_varkind(ls, vname, RDKVAVAR, vtype, vtinfo, 0);
+          }
           else
-            new_localvarliteral(ls, "(vararg table)");
+            new_varkind(ls,
+                        luaX_newstring(ls, "(vararg table)",
+                                       sizeof("(vararg table)") - 1),
+                        VDKREG, VTYPE_TABLE, NULL, 0);
           break;
         }
         default: luaX_syntaxerror(ls, "<name> or '...' expected");
@@ -1104,6 +1630,11 @@ static void body (LexState *ls, expdesc *e, int ismethod, int line) {
   /* body ->  '(' parlist ')' block END */
   FuncState new_fs;
   BlockCnt bl;
+  TypeInfo *retinfo = NULL;
+  int retann = 0;
+  int i;
+  TypeInfo *ftinfo;
+  FuncSigType *sig;
   new_fs.f = addprototype(ls);
   new_fs.f->linedefined = line;
   open_func(ls, &new_fs, &bl);
@@ -1114,10 +1645,33 @@ static void body (LexState *ls, expdesc *e, int ismethod, int line) {
   }
   parlist(ls);
   checknext(ls, ')');
+  new_fs.rettype = gettypeannotation(ls, VTYPE_UNKNOWN, &retinfo, &retann);
+  if (retann)
+    new_fs.rettinfo = retinfo;
   statlist(ls);
   new_fs.f->lastlinedefined = ls->linenumber;
   check_match(ls, TK_END, TK_FUNCTION, line);
+  ftinfo = newtypeinfo(ls, VTYPE_FUNCTION);
+  sig = newfuncsig(ls, new_fs.f->numparams);
+  for (i = 0; i < new_fs.f->numparams; i++) {
+    Vardesc *vd = getlocalvardesc(&new_fs, i);
+    if (vd->vd.tinfo != NULL)
+      sig->params[i] = vd->vd.tinfo;
+    else
+      sig->params[i] = newtypeinfo(ls, vd->vd.type);
+  }
+  if (new_fs.rettype != VTYPE_UNKNOWN) {
+    if (new_fs.rettinfo != NULL)
+      sig->ret = new_fs.rettinfo;
+    else
+      sig->ret = newtypeinfo(ls, new_fs.rettype);
+  }
+  else
+    sig->ret = newtypeinfo(ls, VTYPE_ANY);
+  ftinfo->func = sig;
   codeclosure(ls, e);
+  e->etype = VTYPE_FUNCTION;
+  e->tinfo = ftinfo;
   close_func(ls);
 }
 
@@ -1138,7 +1692,12 @@ static int explist (LexState *ls, expdesc *v) {
 static void funcargs (LexState *ls, expdesc *f) {
   FuncState *fs = ls->fs;
   expdesc args;
+  lu_byte ftype = f->etype;
+  lu_byte argtypes[MAXVARS];
+  TypeInfo *argtinfos[MAXVARS];
+  TypeInfo *ftinfo = vartinfofromexp(ls, f);
   int base, nparams;
+  int nargs = 0;
   int line = ls->linenumber;
   switch (ls->t.token) {
     case '(': {  /* funcargs -> '(' [ explist ] ')' */
@@ -1146,7 +1705,7 @@ static void funcargs (LexState *ls, expdesc *f) {
       if (ls->t.token == ')')  /* arg list is empty? */
         args.k = VVOID;
       else {
-        explist(ls, &args);
+        nargs = explisttyped(ls, &args, argtypes, argtinfos, MAXVARS);
         if (hasmultret(args.k))
           luaK_setmultret(fs, &args);
       }
@@ -1155,11 +1714,17 @@ static void funcargs (LexState *ls, expdesc *f) {
     }
     case '{' /*}*/: {  /* funcargs -> constructor */
       constructor(ls, &args);
+      nargs = 1;
+      argtypes[0] = args.etype;
+      argtinfos[0] = args.tinfo;
       break;
     }
     case TK_STRING: {  /* funcargs -> STRING */
       codestring(&args, ls->t.seminfo.ts);
       luaX_next(ls);  /* must use 'seminfo' before 'next' */
+      nargs = 1;
+      argtypes[0] = args.etype;
+      argtinfos[0] = args.tinfo;
       break;
     }
     default: {
@@ -1176,6 +1741,23 @@ static void funcargs (LexState *ls, expdesc *f) {
     nparams = fs->freereg - (base+1);
   }
   init_exp(f, VCALL, luaK_codeABC(fs, OP_CALL, base, nparams+1, 2));
+  if (ftinfo != NULL && (ftype & VTYPE_FUNCTION) && ftinfo->func != NULL) {
+    FuncSigType *sig = ftinfo->func;
+    if (nparams != LUA_MULTRET) {
+      int i;
+      if (sig->nparams != nargs)
+        luaK_semerror(ls, "function expects %d argument(s), got %d",
+                          sig->nparams, nargs);
+      for (i = 0; i < nargs && i < sig->nparams; i++) {
+        if (!typecompatiblefull(sig->params[i]->mask, sig->params[i],
+                                argtypes[i], argtinfos[i])) {
+          luaK_semerror(ls, "argument %d type mismatch", i + 1);
+        }
+      }
+    }
+    f->etype = sig->ret->mask;
+    f->tinfo = sig->ret;
+  }
   luaK_fixline(fs, line);
   /* call removes function and arguments and leaves one result (unless
      changed later) */
@@ -1230,6 +1812,8 @@ static void suffixedexp (LexState *ls, expdesc *v) {
         luaK_exp2anyregup(fs, v);
         yindex(ls, &key);
         luaK_indexed(fs, v, &key);
+        v->etype = VTYPE_UNKNOWN;
+        v->tinfo = NULL;
         break;
       }
       case ':': {  /* ':' NAME funcargs */
@@ -1258,11 +1842,13 @@ static void simpleexp (LexState *ls, expdesc *v) {
     case TK_FLT: {
       init_exp(v, VKFLT, 0);
       v->u.nval = ls->t.seminfo.r;
+      v->etype = VTYPE_FLOAT;
       break;
     }
     case TK_INT: {
       init_exp(v, VKINT, 0);
       v->u.ival = ls->t.seminfo.i;
+      v->etype = VTYPE_INT;
       break;
     }
     case TK_STRING: {
@@ -1271,14 +1857,17 @@ static void simpleexp (LexState *ls, expdesc *v) {
     }
     case TK_NIL: {
       init_exp(v, VNIL, 0);
+      v->etype = VTYPE_NIL;
       break;
     }
     case TK_TRUE: {
       init_exp(v, VTRUE, 0);
+      v->etype = VTYPE_BOOL;
       break;
     }
     case TK_FALSE: {
       init_exp(v, VFALSE, 0);
+      v->etype = VTYPE_BOOL;
       break;
     }
     case TK_DOTS: {  /* vararg */
@@ -1381,6 +1970,8 @@ static BinOpr subexpr (LexState *ls, expdesc *v, int limit) {
     luaX_next(ls);  /* skip operator */
     subexpr(ls, v, UNARY_PRIORITY);
     luaK_prefix(ls->fs, uop, v, line);
+    v->etype = VTYPE_UNKNOWN;
+    v->tinfo = NULL;
   }
   else simpleexp(ls, v);
   /* expand while operators have priorities higher than 'limit' */
@@ -1394,6 +1985,8 @@ static BinOpr subexpr (LexState *ls, expdesc *v, int limit) {
     /* read sub-expression with higher priority */
     nextop = subexpr(ls, &v2, priority[op].right);
     luaK_posfix(ls->fs, op, v, &v2, line);
+    v->etype = VTYPE_UNKNOWN;
+    v->tinfo = NULL;
     op = nextop;
   }
   leavelevel(ls);
@@ -1511,8 +2104,25 @@ static void restassign (LexState *ls, struct LHS_assign *lh, int nvars) {
   }
   else {  /* restassign -> '=' explist */
     int nexps;
+    lu_byte exptypes[MAXVARS];
+    TypeInfo *exptinfos[MAXVARS];
+    struct LHS_assign *cur;
+    expdesc *lhsvars[MAXVARS];
     checknext(ls, '=');
-    nexps = explist(ls, &e);
+    nexps = explisttyped(ls, &e, exptypes, exptinfos, MAXVARS);
+    if (nvars <= MAXVARS) {
+      int i = nvars - 1;
+      TypeInfo *rtinfo;
+      lu_byte rtype;
+      for (cur = lh; cur != NULL && i >= 0; cur = cur->prev)
+        lhsvars[i--] = &cur->v;
+      for (i = 0; i < nvars; i++) {
+        rtype = rhstypeat(i, nvars, nexps, &e, exptypes, exptinfos, &rtinfo);
+        checktypeassign(ls, lhsvars[i], rtype, rtinfo);
+      }
+    }
+    else
+      checktypeassign(ls, &lh->v, e.etype, e.tinfo);
     if (nexps != nvars)
       adjust_assign(ls, nvars, nexps, &e);
     else {
@@ -1697,7 +2307,7 @@ static void fornum (LexState *ls, TString *varname, int line) {
   int base = fs->freereg;
   new_localvarliteral(ls, "(for state)");
   new_localvarliteral(ls, "(for state)");
-  new_varkind(ls, varname, LOOPVARKIND);  /* control variable */
+  new_varkind(ls, varname, LOOPVARKIND, VTYPE_ANY, NULL, 0);  /* control variable */
   checknext(ls, '=');
   exp1(ls);  /* initial value */
   checknext(ls, ',');
@@ -1724,7 +2334,7 @@ static void forlist (LexState *ls, TString *indexname) {
   new_localvarliteral(ls, "(for state)");  /* iterator function */
   new_localvarliteral(ls, "(for state)");  /* state */
   new_localvarliteral(ls, "(for state)");  /* closing var. (after swap) */
-  new_varkind(ls, indexname, LOOPVARKIND);  /* control variable */
+  new_varkind(ls, indexname, LOOPVARKIND, VTYPE_ANY, NULL, 0);  /* control variable */
   /* other declared variables */
   while (testnext(ls, ',')) {
     new_localvar(ls, str_checkname(ls));
@@ -1787,6 +2397,160 @@ static void ifstat (LexState *ls, int line) {
 }
 
 
+static void statlistuntil (LexState *ls, int stop1, int stop2) {
+  while (!block_follow(ls, 1) && ls->t.token != stop1 && ls->t.token != stop2) {
+    if (ls->t.token == TK_RETURN) {
+      statement(ls);
+      return;
+    }
+    statement(ls);
+  }
+}
+
+
+static int callwithargs (FuncState *fs, expdesc *func,
+                         expdesc *args, int nargs, int nresults) {
+  int i;
+  int base;
+  luaK_exp2nextreg(fs, func);
+  base = func->u.info;
+  for (i = 0; i < nargs; i++)
+    luaK_exp2nextreg(fs, &args[i]);
+  luaK_codeABC(fs, OP_CALL, base, nargs + 1, nresults + 1);
+  fs->freereg = cast_byte(base + nresults);
+  return base;
+}
+
+
+static void parseblockclosureuntil (LexState *ls, expdesc *e, int stoptok) {
+  FuncState new_fs;
+  BlockCnt bl;
+  new_fs.f = addprototype(ls);
+  new_fs.f->linedefined = ls->linenumber;
+  open_func(ls, &new_fs, &bl);
+  statlistuntil(ls, stoptok, -1);
+  new_fs.f->lastlinedefined = ls->linenumber;
+  codeclosure(ls, e);
+  e->etype = VTYPE_FUNCTION;
+  e->tinfo = NULL;
+  close_func(ls);
+}
+
+
+static void matchstat (LexState *ls, int line) {
+  FuncState *fs = ls->fs;
+  BlockCnt bl;
+  expdesc matched;
+  expdesc mvar;
+  int mvidx;
+  int escapelist = NO_JUMP;
+  luaX_next(ls);  /* skip 'match' */
+  expr(ls, &matched);
+  enterblock(fs, &bl, 0);
+  mvidx = new_localvarliteral(ls, "(match value)");
+  adjust_assign(ls, 1, 1, &matched);
+  adjustlocalvars(ls, 1);
+  init_var(fs, &mvar, mvidx);
+  checknext(ls, TK_DO);
+  check(ls, TK_CASE);
+  while (ls->t.token == TK_CASE) {
+    expdesc eqfn;
+    expdesc args[2];
+    expdesc condexp;
+    int base;
+    int condfalse;
+    luaX_next(ls);  /* skip 'case' */
+    buildvar(ls, luaX_newstring(ls, "rawequal", sizeof("rawequal") - 1), &eqfn);
+    args[0] = mvar;
+    expr(ls, &args[1]);
+    base = callwithargs(fs, &eqfn, args, 2, 1);
+    init_exp(&condexp, VNONRELOC, base);
+    condexp.etype = VTYPE_BOOL;
+    condexp.tinfo = NULL;
+    luaK_goiftrue(fs, &condexp);
+    condfalse = condexp.f;
+    checknext(ls, TK_THEN);
+    statlistuntil(ls, TK_CASE, TK_ELSE);
+    luaK_concat(fs, &escapelist, luaK_jump(fs));
+    luaK_patchtohere(fs, condfalse);
+  }
+  if (testnext(ls, TK_ELSE))
+    statlistuntil(ls, TK_END, -1);
+  check_match(ls, TK_END, TK_MATCH, line);
+  luaK_patchtohere(fs, escapelist);
+  leaveblock(fs);
+}
+
+
+static void withstat (LexState *ls, int line) {
+  FuncState *fs = ls->fs;
+  BlockCnt bl;
+  TString *name;
+  int vidx;
+  expdesc e;
+  expdesc vexp;
+  luaX_next(ls);  /* skip 'with' */
+  name = str_checkname(ls);
+  checknext(ls, '=');
+  expr(ls, &e);
+  enterblock(fs, &bl, 0);
+  vidx = new_varkind(ls, name, VDKREG, VTYPE_ANY, NULL, 1);
+  init_exp(&vexp, VLOCAL, 0);
+  vexp.etype = getlocalvardesc(fs, vidx)->vd.type;
+  vexp.tinfo = getlocalvardesc(fs, vidx)->vd.tinfo;
+  vexp.u.var.vidx = cast_short(vidx);
+  vexp.u.var.ridx = 0;
+  checktypeassign(ls, &vexp, e.etype, e.tinfo);
+  adjust_assign(ls, 1, 1, &e);
+  adjustlocalvars(ls, 1);
+  checknext(ls, TK_DO);
+  statlistuntil(ls, TK_END, -1);
+  check_match(ls, TK_END, TK_WITH, line);
+  leaveblock(fs);
+}
+
+
+static void trystat (LexState *ls, int line) {
+  FuncState *fs = ls->fs;
+  expdesc pcallfn;
+  expdesc tryclosure;
+  expdesc args[1];
+  expdesc okexp;
+  BlockCnt rescuebl;
+  TString *errname = NULL;
+  int base;
+  int skiprescue;
+  luaX_next(ls);  /* skip 'try' */
+  checknext(ls, TK_DO);
+  parseblockclosureuntil(ls, &tryclosure, TK_RESCUE);
+  checknext(ls, TK_RESCUE);
+  if (ls->t.token == TK_NAME)
+    errname = str_checkname(ls);
+  checknext(ls, TK_DO);
+  buildvar(ls, luaX_newstring(ls, "pcall", sizeof("pcall") - 1), &pcallfn);
+  args[0] = tryclosure;
+  base = callwithargs(fs, &pcallfn, args, 1, 2);
+  init_exp(&okexp, VNONRELOC, base);
+  okexp.etype = VTYPE_BOOL;
+  okexp.tinfo = NULL;
+  luaK_goiftrue(fs, &okexp);
+  skiprescue = luaK_jump(fs);
+  luaK_patchtohere(fs, okexp.f);
+  enterblock(fs, &rescuebl, 0);
+  if (errname != NULL) {
+    int eidx = new_varkind(ls, errname, VDKREG, VTYPE_ANY, NULL, 0);
+    int ridx;
+    adjustlocalvars(ls, 1);
+    ridx = getlocalvardesc(fs, eidx)->vd.ridx;
+    luaK_codeABC(fs, OP_MOVE, ridx, base + 1, 0);
+  }
+  statlistuntil(ls, TK_END, -1);
+  check_match(ls, TK_END, TK_TRY, line);
+  leaveblock(fs);
+  luaK_patchtohere(fs, skiprescue);
+}
+
+
 static void localfunc (LexState *ls) {
   expdesc b;
   FuncState *fs = ls->fs;
@@ -1825,20 +2589,30 @@ static void checktoclose (FuncState *fs, int level) {
 
 
 static void localstat (LexState *ls) {
-  /* stat -> LOCAL NAME attrib { ',' NAME attrib } ['=' explist] */
+  /* stat -> LOCAL NAME ['::' type] attrib
+             { ',' NAME ['::' type] attrib } ['=' explist] */
   FuncState *fs = ls->fs;
   int toclose = -1;  /* index of to-be-closed variable (if any) */
   Vardesc *var;  /* last variable */
   int vidx;  /* index of last variable */
   int nvars = 0;
   int nexps;
+  int hasinit;
+  int firstidx;
+  lu_byte exptypes[MAXVARS];
+  lu_byte *types = exptypes;
+  TypeInfo *exptinfos[MAXVARS];
+  TypeInfo **tinfos = exptinfos;
   expdesc e;
   /* get prefixed attribute (if any); default is regular local variable */
   lu_byte defkind = getvarattribute(ls, VDKREG);
   do {  /* for each variable */
     TString *vname = str_checkname(ls);  /* get its name */
+    TypeInfo *vtinfo = NULL;
+    int annotated = 0;
+    lu_byte vtype = gettypeannotation(ls, VTYPE_ANY, &vtinfo, &annotated);
     lu_byte kind = getvarattribute(ls, defkind);  /* postfixed attribute */
-    vidx = new_varkind(ls, vname, kind);  /* predeclare it */
+    vidx = new_varkind(ls, vname, kind, vtype, vtinfo, cast_byte(!annotated));  /* predeclare it */
     if (kind == RDKTOCLOSE) {  /* to-be-closed? */
       if (toclose != -1)  /* one already present? */
         luaK_semerror(ls, "multiple to-be-closed variables in local list");
@@ -1846,11 +2620,32 @@ static void localstat (LexState *ls) {
     }
     nvars++;
   } while (testnext(ls, ','));
-  if (testnext(ls, '='))  /* initialization? */
-    nexps = explist(ls, &e);
+  firstidx = vidx - nvars + 1;
+  if (nvars > MAXVARS)
+    types = NULL, tinfos = NULL;
+  hasinit = testnext(ls, '=');
+  if (hasinit)  /* initialization? */
+    nexps = explisttyped(ls, &e, types, tinfos, MAXVARS);
   else {
     e.k = VVOID;
+    e.etype = VTYPE_NIL;
+    e.tinfo = NULL;
     nexps = 0;
+  }
+  if (hasinit) {
+    int i;
+    TypeInfo *rtinfo;
+    lu_byte rtype;
+    for (i = 0; i < nvars; i++) {
+      expdesc vexp;
+      init_exp(&vexp, VLOCAL, 0);
+      vexp.etype = getlocalvardesc(fs, firstidx + i)->vd.type;
+      vexp.tinfo = getlocalvardesc(fs, firstidx + i)->vd.tinfo;
+      vexp.u.var.vidx = cast_short(firstidx + i);
+      vexp.u.var.ridx = 0;
+      rtype = rhstypeat(i, nvars, nexps, &e, types, tinfos, &rtinfo);
+      checktypeassign(ls, &vexp, rtype, rtinfo);
+    }
   }
   var = getlocalvardesc(fs, vidx);  /* retrieve last variable */
   if (nvars == nexps &&  /* no adjustments? */
@@ -1904,7 +2699,27 @@ static void initglobal (LexState *ls, int nvars, int firstidx, int n,
                         int line) {
   if (n == nvars) {  /* traversed all variables? */
     expdesc e;
-    int nexps = explist(ls, &e);  /* read list of expressions */
+    lu_byte exptypes[MAXVARS];
+    lu_byte *types = exptypes;
+    TypeInfo *exptinfos[MAXVARS];
+    TypeInfo **tinfos = exptinfos;
+    int i;
+    int nexps;
+    if (nvars > MAXVARS)
+      types = NULL, tinfos = NULL;
+    nexps = explisttyped(ls, &e, types, tinfos, MAXVARS);  /* read list */
+    for (i = 0; i < nvars; i++) {
+      Vardesc *vd = getlocalvardesc(ls->fs, firstidx + i);
+      expdesc vexp;
+      TypeInfo *rtinfo;
+      lu_byte rtype;
+      init_exp(&vexp, VGLOBAL, 0);
+      vexp.etype = vd->vd.type;
+      vexp.tinfo = vd->vd.tinfo;
+      vexp.u.info = ls->fs->firstlocal + firstidx + i;
+      rtype = rhstypeat(i, nvars, nexps, &e, types, tinfos, &rtinfo);
+      checktypeassign(ls, &vexp, rtype, rtinfo);
+    }
     adjust_assign(ls, nvars, nexps, &e);
   }
   else {  /* handle variable 'n' */
@@ -1927,8 +2742,11 @@ static void globalnames (LexState *ls, lu_byte defkind) {
   int lastidx;  /* index of last registered variable */
   do {  /* for each name */
     TString *vname = str_checkname(ls);
+    TypeInfo *vtinfo = NULL;
+    int annotated = 0;
+    lu_byte vtype = gettypeannotation(ls, VTYPE_ANY, &vtinfo, &annotated);
     lu_byte kind = getglobalattribute(ls, defkind);
-    lastidx = new_varkind(ls, vname, kind);
+    lastidx = new_varkind(ls, vname, kind, vtype, vtinfo, cast_byte(!annotated));
     nvars++;
   } while (testnext(ls, ','));
   if (testnext(ls, '='))  /* initialization? */
@@ -1947,7 +2765,7 @@ static void globalstat (LexState *ls) {
     globalnames(ls, defkind);
   else {
     /* use NULL as name to represent '*' entries */
-    new_varkind(ls, NULL, defkind);
+    new_varkind(ls, NULL, defkind, VTYPE_ANY, NULL, 0);
     fs->nactvar++;  /* activate declaration */
   }
 }
@@ -1958,7 +2776,7 @@ static void globalfunc (LexState *ls, int line) {
   expdesc var, b;
   FuncState *fs = ls->fs;
   TString *fname = str_checkname(ls);
-  new_varkind(ls, fname, GDKREG);  /* declare global variable */
+  new_varkind(ls, fname, GDKREG, VTYPE_ANY, NULL, 0);  /* declare global variable */
   fs->nactvar++;  /* enter its scope */
   buildglobal(ls, fname, &var);
   body(ls, &b, 0, ls->linenumber);  /* compile and return closure in 'b' */
@@ -2033,6 +2851,10 @@ static void retstat (LexState *ls) {
     nret = 0;  /* return no values */
   else {
     nret = explist(ls, &e);  /* optional return values */
+    if (fs->rettype != VTYPE_UNKNOWN &&
+        !typecompatiblefull(fs->rettype, fs->rettinfo, e.etype, e.tinfo)) {
+      luaK_semerror(ls, "return type mismatch");
+    }
     if (hasmultret(e.k)) {
       luaK_setmultret(fs, &e);
       if (e.k == VCALL && nret == 1 && !fs->bl->insidetbc) {  /* tail call? */
@@ -2050,10 +2872,11 @@ static void retstat (LexState *ls) {
       }
     }
   }
+  if (nret == 0 && fs->rettype != VTYPE_UNKNOWN && (fs->rettype & VTYPE_UNIT) == 0)
+    luaK_semerror(ls, "return type mismatch");
   luaK_ret(fs, first, nret);
   testnext(ls, ';');  /* skip optional semicolon */
 }
-
 
 static void statement (LexState *ls) {
   int line = ls->linenumber;  /* may be needed for error messages */
@@ -2065,6 +2888,18 @@ static void statement (LexState *ls) {
     }
     case TK_IF: {  /* stat -> ifstat */
       ifstat(ls, line);
+      break;
+    }
+    case TK_MATCH: {  /* stat -> matchstat */
+      matchstat(ls, line);
+      break;
+    }
+    case TK_WITH: {  /* stat -> withstat */
+      withstat(ls, line);
+      break;
+    }
+    case TK_TRY: {  /* stat -> trystat */
+      trystat(ls, line);
       break;
     }
     case TK_WHILE: {  /* stat -> whilestat */
